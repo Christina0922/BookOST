@@ -1,9 +1,23 @@
 import type { GenerateResponse } from "./types";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:8000";
+const WEB_API_BASE = "/api";
+
+type ApiErr = { detail?: string };
+
+async function parseError(res: Response): Promise<never> {
+  let message = `Request failed (${res.status})`;
+  try {
+    const data = (await res.json()) as ApiErr;
+    if (data?.detail) message = data.detail;
+  } catch {
+    const text = await res.text().catch(() => "");
+    if (text) message = text;
+  }
+  throw new Error(message);
+}
 
 export async function generateOst(text: string, targetDurationSec?: number): Promise<GenerateResponse> {
-  const res = await fetch(`${API_BASE}/v1/generate/`, {
+  const res = await fetch(`${WEB_API_BASE}/generate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -11,10 +25,7 @@ export async function generateOst(text: string, targetDurationSec?: number): Pro
       target_duration_sec: targetDurationSec,
     }),
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(detail || `Request failed (${res.status})`);
-  }
+  if (!res.ok) await parseError(res);
   return (await res.json()) as GenerateResponse;
 }
 
@@ -23,13 +34,10 @@ export async function generateOstFromImage(file: File, targetDurationSec?: numbe
   fd.append("file", file);
   if (targetDurationSec != null) fd.append("target_duration_sec", String(targetDurationSec));
 
-  const res = await fetch(`${API_BASE}/v1/generate/image`, {
+  const res = await fetch(`${WEB_API_BASE}/generate/image`, {
     method: "POST",
     body: fd,
   });
-  if (!res.ok) {
-    const detail = await res.text();
-    throw new Error(detail || `Request failed (${res.status})`);
-  }
+  if (!res.ok) await parseError(res);
   return (await res.json()) as GenerateResponse;
 }
