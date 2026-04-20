@@ -4,8 +4,10 @@ import { join } from "path";
 import { NextResponse } from "next/server";
 
 import { analyzeEmotionFromText } from "@/lib/analyzeEmotion";
+import { analyzeScene } from "@/lib/analyzeScene";
+import { generateMidiFromParameters } from "@/lib/generateMidi";
+import { generateMusicParameters } from "@/lib/generateMusicParameters";
 import { getAudioPresetByEmotion } from "@/lib/mapEmotionToAudio";
-import { buildLayerPlan, buildSceneAnalysis } from "@/lib/sceneMusic";
 import type { GenerateOstResponse } from "@/types/ost";
 
 export async function POST(req: Request) {
@@ -21,26 +23,16 @@ export async function POST(req: Request) {
     }
 
     const analysis = analyzeEmotionFromText(text);
-    const preset = getAudioPresetByEmotion(analysis.emotion);
-    const scene = buildSceneAnalysis(text, analysis);
-    const layerPlan = buildLayerPlan(scene);
-
-    const layerEntries = Object.entries(layerPlan).filter((entry): entry is [keyof typeof layerPlan, string] => Boolean(entry[1]));
-    const existingLayers: Partial<typeof layerPlan> = {};
-    for (const [layerType, layerUrl] of layerEntries) {
-      const layerPath = join(process.cwd(), "public", layerUrl.replace(/^\//, ""));
-      if (existsSync(layerPath)) {
-        existingLayers[layerType] = layerUrl;
-      }
-    }
-    const layerSources = Object.values(existingLayers).filter((layer): layer is string => Boolean(layer));
-    const useLayerMix = layerSources.length >= 2;
+    const sceneAnalysis = analyzeScene(text);
+    const preset = getAudioPresetByEmotion(sceneAnalysis.emotion);
+    const musicParameters = generateMusicParameters(sceneAnalysis, text);
+    const generated = generateMidiFromParameters(musicParameters);
 
     // public/audio missing fallback handling
     const audioPath = join(process.cwd(), "public", preset.audioUrl.replace(/^\//, ""));
     const finalPreset = preset;
     const fallbackAudioReady = existsSync(audioPath);
-    const isAudioReady = useLayerMix || fallbackAudioReady;
+    const isAudioReady = generated.notes.length > 0 || fallbackAudioReady;
     const fallbackReason: "preset_missing" | "all_missing" | undefined = isAudioReady ? undefined : "all_missing";
 
     const resolvedPreset = {
@@ -52,17 +44,22 @@ export async function POST(req: Request) {
 
     return NextResponse.json<GenerateOstResponse>({
       success: true,
-      emotion: analysis.emotion,
+      emotion: sceneAnalysis.emotion,
       preset: resolvedPreset,
-      scene,
-      layers: existingLayers,
-      layerSources,
-      mixMode: useLayerMix ? "layers" : "fallback",
+      sceneAnalysis,
+      musicParameters,
+      scene_summary: sceneAnalysis.scene_summary,
+      emotion_weights: sceneAnalysis.emotion_weights,
+      scene_type: sceneAnalysis.scene_type,
+      tone: sceneAnalysis.tone,
+      explanation: sceneAnalysis.explanation,
+      generated,
+      mixMode: generated.notes.length > 0 ? "generated" : "fallback",
       moodLabel: resolvedPreset.moodLabel,
       ostTitle: resolvedPreset.ostTitle,
       description: resolvedPreset.description,
       sceneInterpretation: resolvedPreset.sceneInterpretation,
-      audioUrl: useLayerMix ? layerSources[0] : resolvedPreset.audioUrl,
+      audioUrl: resolvedPreset.audioUrl,
       tags: resolvedPreset.tags,
       selectedPresetEmotion: resolvedPreset.emotion,
       isAudioReady,

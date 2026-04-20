@@ -8,7 +8,6 @@ const SAMPLE =
 const MAX_IMAGE_BYTES = 12 * 1024 * 1024;
 const RESIZE_TRIGGER_BYTES = 4 * 1024 * 1024;
 const MAX_IMAGE_SIDE = 2200;
-const LAYER_ORDER: Array<keyof GenerateOstSuccess["layers"]> = ["base", "rhythm", "melodic", "effect"];
 
 function getEmotionVisual(emotion: string) {
   switch (emotion) {
@@ -44,9 +43,11 @@ function getEmotionVisual(emotion: string) {
 }
 
 export default function HomePage() {
+  type PipelineStage = "idle" | "analyzing" | "generating" | "ready";
   const [text, setText] = useState(SAMPLE);
   const [loading, setLoading] = useState(false);
   const [ocrLoading, setOcrLoading] = useState(false);
+  const [pipelineStage, setPipelineStage] = useState<PipelineStage>("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<GenerateOstSuccess | null>(null);
   const [audioNotice, setAudioNotice] = useState<string | null>(null);
@@ -65,6 +66,7 @@ export default function HomePage() {
     [],
   );
   const emotionUi = result ? getEmotionVisual(result.emotion) : null;
+  const pipelineProgress = pipelineStage === "idle" ? 0 : pipelineStage === "analyzing" ? 33 : pipelineStage === "generating" ? 72 : 100;
 
   useEffect(() => {
     return () => {
@@ -115,46 +117,54 @@ export default function HomePage() {
     return wav;
   }
 
-  async function buildLayerMix(layerUrls: string[]): Promise<string> {
-    const AudioContextCtor = window.AudioContext || (window as Window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
-    if (!AudioContextCtor) {
-      throw new Error("이 브라우저는 오디오 합성을 지원하지 않습니다.");
+  function midiToFrequency(midi: number): number {
+    return 440 * 2 ** ((midi - 69) / 12);
+  }
+
+  function waveformForInstrument(instrument: string): OscillatorType {
+    if (instrument === "soft_pad" || instrument === "dark_pad" || instrument === "ambient_noise") return "triangle";
+    if (instrument === "bass") return "sawtooth";
+    if (instrument === "perc" || instrument === "percussion" || instrument === "light_percussion") return "square";
+    if (instrument === "pluck" || instrument === "pulse_synth" || instrument === "bell") return "square";
+    return "sine";
+  }
+
+  async function renderGeneratedTrack(data: GenerateOstSuccess): Promise<string> {
+    const durationSec = Math.max(8, data.musicParameters.duration_sec);
+    const sampleRate = 44100;
+    const offline = new OfflineAudioContext(2, Math.ceil(durationSec * sampleRate), sampleRate);
+    const notes = data.generated.notes;
+    const masterGain = offline.createGain();
+    masterGain.gain.value = 0.78;
+    masterGain.connect(offline.destination);
+
+    for (const note of notes) {
+      const osc = offline.createOscillator();
+      const gain = offline.createGain();
+      const start = Math.max(0, note.start_sec);
+      const end = Math.min(durationSec, note.start_sec + Math.max(0.03, note.duration_sec));
+      if (end <= start) continue;
+
+      osc.type = waveformForInstrument(note.instrument);
+      osc.frequency.value = midiToFrequency(note.midi);
+      if (note.instrument === "bass") {
+        osc.detune.value = -7;
+      }
+
+      const amp = Math.min(0.3, Math.max(0.04, note.velocity / 420));
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.linearRampToValueAtTime(amp, start + 0.01);
+      gain.gain.linearRampToValueAtTime(amp * 0.75, start + (end - start) * 0.6);
+      gain.gain.linearRampToValueAtTime(0.0001, end);
+
+      osc.connect(gain).connect(masterGain);
+      osc.start(start);
+      osc.stop(end + 0.02);
     }
 
-    const decodeContext = new AudioContextCtor();
-    try {
-      const decoded = await Promise.all(
-        layerUrls.map(async (url) => {
-          const res = await fetch(url);
-          if (!res.ok) {
-            throw new Error(`레이어 파일을 불러오지 못했습니다: ${url}`);
-          }
-          const arr = await res.arrayBuffer();
-          return decodeContext.decodeAudioData(arr.slice(0));
-        }),
-      );
-
-      const maxDuration = Math.max(...decoded.map((buffer) => buffer.duration), 8);
-      const sampleRate = 44100;
-      const offline = new OfflineAudioContext(2, Math.ceil(maxDuration * sampleRate), sampleRate);
-      const gains = [0.52, 0.36, 0.31, 0.24];
-
-      decoded.forEach((buffer, index) => {
-        const source = offline.createBufferSource();
-        source.buffer = buffer;
-        const gain = offline.createGain();
-        gain.gain.value = gains[index] ?? 0.25;
-        source.connect(gain).connect(offline.destination);
-        source.start(0);
-      });
-
-      const rendered = await offline.startRendering();
-      const wav = bufferToWav(rendered);
-      const blobUrl = URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
-      return blobUrl;
-    } finally {
-      void decodeContext.close();
-    }
+    const rendered = await offline.startRendering();
+    const wav = bufferToWav(rendered);
+    return URL.createObjectURL(new Blob([wav], { type: "audio/wav" }));
   }
 
   async function preparePlayback(data: GenerateOstSuccess) {
@@ -163,15 +173,15 @@ export default function HomePage() {
       lastBlobUrlRef.current = null;
     }
 
-    if (data.mixMode === "layers" && data.layerSources.length >= 2) {
+    if (data.mixMode === "generated" && data.generated.notes.length > 0) {
       setMixingAudio(true);
       try {
-        const mixedUrl = await buildLayerMix(data.layerSources);
+        const mixedUrl = await renderGeneratedTrack(data);
         lastBlobUrlRef.current = mixedUrl;
         setPlaybackUrl(mixedUrl);
       } catch {
         setPlaybackUrl(data.audioUrl);
-        setAudioNotice("레이어 믹스에 실패해 기본 트랙으로 재생합니다.");
+        setAudioNotice("생성 트랙 렌더링에 실패해 fallback 오디오로 재생합니다.");
       } finally {
         setMixingAudio(false);
       }
@@ -183,6 +193,7 @@ export default function HomePage() {
 
   async function runGenerate(trimmed: string) {
     setLoading(true);
+    setPipelineStage("analyzing");
     setAudioNotice(null);
 
     try {
@@ -197,8 +208,10 @@ export default function HomePage() {
         throw new Error(data.success ? "요청 처리에 실패했습니다." : data.message);
       }
 
+      setPipelineStage("generating");
       await preparePlayback(data);
       setResult(data);
+      setPipelineStage("ready");
       // Best-effort autoplay after user gesture.
       queueMicrotask(() => {
         if (!audioRef.current) return;
@@ -209,6 +222,7 @@ export default function HomePage() {
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "알 수 없는 오류가 발생했습니다.");
+      setPipelineStage("idle");
     } finally {
       setLoading(false);
     }
@@ -221,6 +235,7 @@ export default function HomePage() {
       return;
     }
     setError(null);
+    setPipelineStage("idle");
     await runGenerate(trimmed);
   }
 
@@ -274,6 +289,7 @@ export default function HomePage() {
     setOcrLoading(true);
     setError(null);
     setAudioNotice(null);
+    setPipelineStage("idle");
 
     try {
       const { blob, resized } = await optimizeImageForOcr(f);
@@ -292,7 +308,7 @@ export default function HomePage() {
       }
 
       setText(recognized);
-      await runGenerate(recognized);
+      setAudioNotice("이미지 텍스트를 입력창에 반영했습니다. 'OST 만들기'를 눌러 생성하세요.");
     } catch (e) {
       setError(e instanceof Error ? e.message : "이미지 인식 중 오류가 발생했습니다.");
     } finally {
@@ -332,18 +348,20 @@ export default function HomePage() {
             />
           </label>
 
-          <input
-            ref={fileRef}
-            type="file"
-            accept="image/*"
-            className="hidden"
-            onChange={(e) => {
-              const f = e.target.files?.[0];
-              if (f) void onImageSelected(f);
-            }}
-          />
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:items-center">
+          <div className="space-y-3">
+            <label className="block">
+              <span className="mb-2 block text-sm font-semibold text-slate-200">이미지 업로드 (OCR)</span>
+              <input
+                ref={fileRef}
+                type="file"
+                accept="image/*"
+                className="block w-full cursor-pointer rounded-xl border border-slate-600 bg-slate-900/70 px-3 py-2 text-sm text-slate-200 file:mr-3 file:rounded-md file:border-0 file:bg-indigo-500 file:px-3 file:py-1.5 file:text-xs file:font-semibold file:text-white hover:border-indigo-400"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void onImageSelected(f);
+                }}
+              />
+            </label>
             <button
               type="button"
               onClick={onGenerate}
@@ -351,14 +369,6 @@ export default function HomePage() {
               className="w-full rounded-xl bg-gradient-to-r from-indigo-500 to-violet-500 px-6 py-3.5 text-base font-bold text-white shadow-lg shadow-indigo-500/30 transition hover:-translate-y-0.5 hover:from-indigo-400 hover:to-violet-400 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {loading ? "장면을 분석하고 OST를 준비하는 중입니다..." : "OST 만들기"}
-            </button>
-            <button
-              type="button"
-              onClick={() => fileRef.current?.click()}
-              disabled={loading || ocrLoading}
-              className="w-full rounded-xl border border-slate-500 bg-slate-800/50 px-6 py-3.5 text-base font-semibold text-slate-100 transition hover:bg-slate-700/60 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {ocrLoading ? "처리 중…" : "사진·스크린샷 → 인식 후 OST"}
             </button>
           </div>
           <div className="flex items-center justify-between gap-2">
@@ -407,110 +417,73 @@ export default function HomePage() {
         ) : null}
 
         {result ? (
-          <section
-            className={`mt-10 space-y-5 rounded-3xl border bg-gradient-to-br p-5 shadow-2xl sm:p-6 md:p-7 ${emotionUi?.accentSectionClass}`}
-          >
+          <section className={`mt-10 space-y-5 rounded-3xl border bg-gradient-to-br p-5 shadow-2xl sm:p-6 md:p-7 ${emotionUi?.accentSectionClass}`}>
             <header className="space-y-2.5">
-              <p className="text-xs font-semibold uppercase tracking-[0.15em] text-indigo-200">AI 분석 결과</p>
-              <h2 className="text-2xl font-extrabold leading-tight text-white sm:text-3xl">이 장면에 맞는 OST를 준비했습니다.</h2>
-              <p className="max-w-3xl text-sm leading-6 text-slate-300">
-                입력한 문장의 감정과 분위기를 바탕으로 현재 장면에 어울리는 오디오를 선택했습니다.
-              </p>
+              <p className="text-xs font-semibold uppercase tracking-[0.15em] text-indigo-200">해석 → 생성 결과</p>
+              <h2 className="text-2xl font-extrabold leading-tight text-white sm:text-3xl">입력 문장을 분석하고 바로 OST를 생성했습니다.</h2>
+              <p className="max-w-3xl text-sm leading-6 text-slate-300">입력 → 분석 → 생성 → 재생 흐름이 한 번에 이어집니다.</p>
             </header>
 
-            <div className={`rounded-2xl border bg-gradient-to-r p-4 ${emotionUi?.accentHeroClass}`}>
-              <div className="flex flex-wrap items-center gap-2.5">
-                <span className={`inline-flex items-center rounded-full border px-3.5 py-1.5 text-sm font-bold ${emotionUi?.badgeClass}`}>
-                  {result.moodLabel}
-                </span>
-                <span className="inline-flex items-center rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs text-slate-200">
-                  Mock OST
-                </span>
-              </div>
-              <p className="mt-3 max-w-3xl text-sm leading-6 text-slate-100">{result.description}</p>
-              <p className="mt-2 text-sm leading-6 text-slate-300">장면 해석: {result.sceneInterpretation}</p>
-            </div>
-
-            <div className="rounded-2xl bg-slate-800/70 p-4">
-              <p className="text-sm font-semibold text-slate-100">분석 요약</p>
-              <div className="mt-3 grid gap-2.5 text-sm leading-6 text-slate-200 sm:grid-cols-2">
-                <p>
-                  감정 라벨:
-                  <span className="ml-2 inline-flex items-center rounded-full bg-indigo-500/25 px-2.5 py-0.5 text-xs font-semibold text-indigo-100">
-                    {result.moodLabel}
+            <div className="grid gap-4 lg:grid-cols-2">
+              <section className="rounded-2xl border border-white/10 bg-slate-900/55 p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-indigo-200">[A] Scene Analysis</p>
+                <div className="mt-2 flex items-center gap-2 text-xs">
+                  <span className={`rounded-full px-2 py-0.5 ${pipelineStage === "analyzing" ? "animate-pulse bg-indigo-500/35 text-indigo-100" : "bg-slate-700/60 text-slate-300"}`}>
+                    Analyzing
                   </span>
-                </p>
-                <p>
-                  프리셋:
-                  <span className="ml-2 font-semibold text-white">{result.selectedPresetEmotion}</span>
-                </p>
-                <p>분석 신뢰도: {(result.score * 100).toFixed(0)}%</p>
-                <p>키워드: {result.keywords.length ? result.keywords.join(", ") : "기본 규칙(calm)"}</p>
-                <p>
-                  선택된 OST: <span className="font-semibold text-white">{result.ostTitle}</span>
-                </p>
-                <p>
-                  템포/에너지:
-                  <span className="ml-2 font-semibold text-white">
-                    {result.scene.tempo} / {result.scene.energy}
+                  <span className={`rounded-full px-2 py-0.5 ${pipelineStage === "ready" || pipelineStage === "generating" ? "bg-emerald-500/30 text-emerald-100" : "bg-slate-700/60 text-slate-300"}`}>
+                    {pipelineStage === "idle" ? "Pending" : "Done"}
                   </span>
-                </p>
-                <p>
-                  톤/배경:
-                  <span className="ml-2 font-semibold text-white">
-                    {result.scene.tone} / {result.scene.setting}
-                  </span>
-                </p>
-              </div>
-              <div className="mt-4 flex flex-wrap gap-2.5 border-t border-white/10 pt-4">
-                {result.tags.map((tag) => (
-                  <span key={tag} className={`rounded-full border px-3 py-1 text-xs ${emotionUi?.accentTagClass}`}>
-                    {tag}
-                  </span>
-                ))}
-              </div>
-            </div>
-
-            <div className="rounded-2xl bg-slate-800/70 p-4 sm:p-5">
-              <p className="text-xs font-semibold uppercase tracking-[0.12em] text-slate-400">오늘의 독서 OST</p>
-              <p className="mt-1 text-sm font-semibold text-white">{result.ostTitle}</p>
-              <p className="mt-1 text-xs text-slate-400">장면의 감정과 분위기를 반영한 추천 오디오입니다.</p>
-              <div className="mt-3 rounded-lg border border-indigo-300/20 bg-indigo-500/10 px-3 py-2 text-xs text-indigo-100">
-                구성 모드: {result.mixMode === "layers" ? "텍스트 기반 레이어 믹스" : "단일 프리셋 fallback"}
-              </div>
-              {result.mixMode === "layers" ? (
-                <div className="mt-3 rounded-lg border border-white/10 bg-slate-900/60 px-3 py-2 text-xs text-slate-200">
-                  {LAYER_ORDER.map((layerType) => {
-                    const layerUrl = result.layers[layerType];
-                    if (!layerUrl) return null;
-                    return (
-                      <p key={layerType}>
-                        {layerType}: <span className="text-slate-100">{layerUrl}</span>
-                      </p>
-                    );
-                  })}
                 </div>
-              ) : null}
-              {!result.isAudioReady ? (
-                <div className="mt-3 rounded-lg border border-amber-300/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-100">
-                  Mock OST 프리셋만 연결된 상태입니다. 실제 재생을 위해 `public/audio`에 mp3 파일을 추가해 주세요.
+                <p className="mt-2 text-sm text-slate-100">장면 해석 요약: {result.scene_summary}</p>
+                <p className="mt-1 text-xs text-slate-300">
+                  복합 감정 분포:{" "}
+                  {Object.entries(result.emotion_weights)
+                    .map(([emotion, weight]) => `${emotion}:${weight}`)
+                    .join(" | ")}
+                </p>
+                <p className="mt-1 text-xs text-slate-300">장면 유형: {result.scene_type}</p>
+                <p className="mt-1 text-xs text-slate-300">tone: {result.tone}</p>
+                <p className="mt-2 text-sm text-slate-200">{result.explanation}</p>
+              </section>
+
+              <section className="rounded-2xl border border-white/10 bg-slate-900/55 p-4">
+                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-emerald-200">[B] Generated OST</p>
+                <div className="mt-2 flex items-center gap-2 text-xs">
+                  <span className={`rounded-full px-2 py-0.5 ${pipelineStage === "generating" ? "animate-pulse bg-violet-500/35 text-violet-100" : "bg-slate-700/60 text-slate-300"}`}>
+                    Generating
+                  </span>
+                  <span className={`rounded-full px-2 py-0.5 ${pipelineStage === "ready" ? "bg-emerald-500/30 text-emerald-100" : "bg-slate-700/60 text-slate-300"}`}>
+                    {pipelineStage === "ready" ? "Ready" : "Pending"}
+                  </span>
                 </div>
-              ) : null}
-              <div className="mt-3 rounded-xl border border-white/10 bg-slate-900/60 p-2 sm:p-3">
-                <audio
-                  ref={audioRef}
-                  key={playbackUrl ?? result.audioUrl}
-                  controls
-                  autoPlay
-                  className="w-full"
-                  src={playbackUrl ?? result.audioUrl}
-                  onError={() => {
-                    setAudioNotice("오디오 파일을 찾지 못했습니다. public/audio 폴더의 mp3 파일을 확인해 주세요.");
-                  }}
-                />
-              </div>
-              {mixingAudio ? <p className="mt-2 text-xs text-indigo-300">레이어 오디오를 합성하고 있습니다...</p> : null}
-              {audioNotice ? <p className="mt-2 text-xs text-amber-300">{audioNotice}</p> : null}
+                <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-slate-700/70">
+                  <div
+                    className={`h-full rounded-full bg-gradient-to-r from-indigo-400 via-violet-400 to-emerald-400 transition-all duration-500 ${pipelineStage !== "idle" && pipelineStage !== "ready" ? "animate-pulse" : ""}`}
+                    style={{ width: `${pipelineProgress}%` }}
+                  />
+                </div>
+                <p className="mt-2 text-sm text-slate-100">30초 생성 음악 (scene-based loop)</p>
+                <p className="mt-1 text-xs text-emerald-300">Generated from analysis</p>
+                <p className="mt-2 text-xs text-slate-300">
+                  tempo: {result.musicParameters.tempo_bpm} bpm · key/mode: {result.musicParameters.key}/{result.musicParameters.mode}
+                </p>
+                <div className="mt-3 rounded-xl border border-white/10 bg-slate-900/60 p-2 sm:p-3">
+                  <audio
+                    ref={audioRef}
+                    key={playbackUrl ?? result.audioUrl}
+                    controls
+                    autoPlay
+                    className="w-full"
+                    src={playbackUrl ?? result.audioUrl}
+                    onError={() => {
+                      setAudioNotice("오디오를 재생하지 못했습니다. 잠시 후 다시 시도해 주세요.");
+                    }}
+                  />
+                </div>
+                {mixingAudio ? <p className="mt-2 text-xs text-indigo-300">생성된 MIDI 파라미터를 오디오로 렌더링하고 있습니다...</p> : null}
+                {audioNotice ? <p className="mt-2 text-xs text-amber-300">{audioNotice}</p> : null}
+              </section>
             </div>
           </section>
         ) : null}
