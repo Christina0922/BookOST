@@ -3,10 +3,19 @@ import {
   EMOTION_BOOST_KEYWORDS,
   EMOTION_DEFAULTS,
   EMOTION_KEYWORDS,
+  ENVIRONMENT_RULES,
   SCENE_TYPE_RULES,
+  TIME_FEEL_RULES,
   TONE_RULES,
 } from "@/lib/musicRules";
-import type { EmotionType, SceneAnalysisResult, SceneType, ToneType } from "@/types/music";
+import type {
+  EmotionType,
+  EnvironmentKind,
+  SceneAnalysisResult,
+  SceneType,
+  TimeFeel,
+  ToneType,
+} from "@/types/music";
 
 function clamp(min: number, value: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -55,13 +64,13 @@ function detectEmotionWeights(text: string): {
     calm: Number((baseScores.calm / total).toFixed(2)),
     mysterious: Number((baseScores.mysterious / total).toFixed(2)),
   };
-  // fix rounding drift
   const drift = Number((1 - (weights.tense + weights.sad + weights.calm + weights.mysterious)).toFixed(2));
   if (Math.abs(drift) > 0) {
     weights.calm = Number((weights.calm + drift).toFixed(2));
   }
 
-  const dominantEmotion = (Object.keys(weights) as EmotionType[]).sort((a, b) => weights[b] - weights[a])[0] ?? "calm";
+  const dominantEmotion =
+    (Object.keys(weights) as EmotionType[]).sort((a, b) => weights[b] - weights[a])[0] ?? "calm";
   return {
     dominantEmotion,
     weights,
@@ -100,15 +109,37 @@ function detectTone(text: string): ToneType {
   return "neutral";
 }
 
+function detectTimeFeel(text: string): TimeFeel {
+  const normalized = normalize(text);
+  for (const rule of TIME_FEEL_RULES) {
+    if (rule.words.some((word) => normalized.includes(word))) {
+      return rule.feel;
+    }
+  }
+  return "moderate";
+}
+
+function detectEnvironment(text: string): EnvironmentKind {
+  const normalized = normalize(text);
+  for (const rule of ENVIRONMENT_RULES) {
+    if (rule.words.some((word) => normalized.includes(word))) {
+      return rule.env;
+    }
+  }
+  return "neutral";
+}
+
 function buildInterpretiveExplanation(
   weights: Record<EmotionType, number>,
   sceneType: SceneType,
   tone: ToneType,
+  timeFeel: TimeFeel,
+  env: EnvironmentKind,
 ): string {
   const ranked = (Object.entries(weights) as Array<[EmotionType, number]>).sort((a, b) => b[1] - a[1]);
   const [topEmotion, topWeight] = ranked[0] ?? ["calm", 0.3];
   const [secondEmotion, secondWeight] = ranked[1] ?? ["tense", 0.25];
-  return `이 문장은 ${topEmotion}(${topWeight.toFixed(2)})를 중심으로 ${secondEmotion}(${secondWeight.toFixed(2)})가 함께 느껴지는 ${sceneType} 성격의 장면으로 해석되었습니다. 톤은 ${tone} 쪽으로 반영했습니다.`;
+  return `이 문장은 ${topEmotion}(${topWeight.toFixed(2)})를 중심으로 ${secondEmotion}(${secondWeight.toFixed(2)})가 함께 느껴지는 ${sceneType} 장면입니다. 톤 ${tone}, 시간감 ${timeFeel}, 공간감(환경) ${env}로 해석했습니다.`;
 }
 
 export function analyzeScene(text: string): SceneAnalysisResult {
@@ -116,6 +147,8 @@ export function analyzeScene(text: string): SceneAnalysisResult {
   const defaults = EMOTION_DEFAULTS[detection.dominantEmotion];
   const sceneType = detectSceneType(text);
   const tone = detectTone(text);
+  const timeFeel = detectTimeFeel(text);
+  const environment = detectEnvironment(text);
   const ambience = Array.from(new Set([...detectAmbience(text)]));
   const sortedWeights = Object.entries(detection.weights).sort((a, b) => b[1] - a[1]);
   const topWeight = sortedWeights[0]?.[1] ?? 0.25;
@@ -124,10 +157,22 @@ export function analyzeScene(text: string): SceneAnalysisResult {
     clamp(0.2, 0.4 + topWeight * 0.5 + secondWeight * 0.2, 0.95).toFixed(2),
   );
   const tensionLevel = Number(
-    clamp(0.1, defaults.tension_level + (sceneType === "suspense_build" ? 0.12 : 0) + (emotionIntensity - 0.5) * 0.22, 0.98).toFixed(2),
+    clamp(
+      0.1,
+      defaults.tension_level +
+        (sceneType === "suspense_build" ? 0.12 : 0) +
+        (emotionIntensity - 0.5) * 0.22,
+      0.98,
+    ).toFixed(2),
   );
   const energyLevel = Number(
-    clamp(0.1, defaults.energy_level + (sceneType === "confrontation" ? 0.14 : 0) + (emotionIntensity - 0.5) * 0.18, 0.98).toFixed(2),
+    clamp(
+      0.1,
+      defaults.energy_level +
+        (sceneType === "confrontation" ? 0.14 : 0) +
+        (emotionIntensity - 0.5) * 0.18,
+      0.98,
+    ).toFixed(2),
   );
   const valence = Number(
     clamp(
@@ -141,19 +186,24 @@ export function analyzeScene(text: string): SceneAnalysisResult {
   );
 
   return {
-    scene_summary: `${sceneType} scene (${tone}) with ${ambience.length ? ambience.join(", ") : "neutral ambience"}`,
+    scene_summary: `${sceneType} (${tone}) · ${timeFeel} · ${environment} · ambience: ${
+      ambience.length ? ambience.join(", ") : "neutral"
+    }`,
     emotion: detection.dominantEmotion,
     emotion_weights: detection.weights,
     emotion_intensity: emotionIntensity,
+    intensity: emotionIntensity,
     tension_level: tensionLevel,
     energy_level: energyLevel,
     valence,
     scene_type: sceneType,
     tone,
+    time_feel: timeFeel,
+    environment,
     ambience,
     keywords: detection.keywords,
-    explanation: buildInterpretiveExplanation(detection.weights, sceneType, tone),
-    generation_notes: "Rule-based weighted emotion analysis with scene_type and tone classification.",
+    explanation: buildInterpretiveExplanation(detection.weights, sceneType, tone, timeFeel, environment),
+    generation_notes:
+      "Rule-based scene interpretation: emotion weights, scene_type, tone, time_feel, environment.",
   };
 }
-

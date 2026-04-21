@@ -1,9 +1,11 @@
 import type {
   EmotionType,
+  EnvironmentKind,
   InstrumentType,
   ModeType,
   SceneType,
   StructureType,
+  TimeFeel,
   ToneType,
 } from "@/types/music";
 
@@ -19,6 +21,23 @@ export const AMBIENCE_KEYWORDS: Array<{ words: string[]; ambience: string[] }> =
   { words: ["밤", "네온"], ambience: ["night", "city"] },
   { words: ["복도"], ambience: ["hallway"] },
   { words: ["숲"], ambience: ["forest"] },
+];
+
+/** First match wins — order more specific cues before generic ones. */
+export const TIME_FEEL_RULES: Array<{ words: string[]; feel: TimeFeel }> = [
+  { words: ["꿈", "멀리", "떠올"], feel: "floating" },
+  { words: ["천천히", "잔잔", "고요히"], feel: "slow" },
+  { words: ["추격", "도망", "갑자기", "순간", "급히"], feel: "urgent" },
+  { words: ["행진", "전진", "박자"], feel: "driving" },
+];
+
+export const ENVIRONMENT_RULES: Array<{ words: string[]; env: EnvironmentKind }> = [
+  { words: ["비", "빗", "rain", "rainy"], env: "rain" },
+  { words: ["밤", "night"], env: "night" },
+  { words: ["네온", "거리", "city", "urban"], env: "city" },
+  { words: ["숲", "forest"], env: "forest" },
+  { words: ["방", "실내", "cafe", "café", "interior"], env: "interior" },
+  { words: ["바다", "sea", "ocean"], env: "sea" },
 ];
 
 export const STRUCTURE_KEYWORDS: Array<{ words: string[]; structure: StructureType }> = [

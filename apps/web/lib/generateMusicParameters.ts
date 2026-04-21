@@ -1,5 +1,16 @@
 import { EMOTION_DEFAULTS, STRUCTURE_KEYWORDS } from "@/lib/musicRules";
-import type { MusicParameterResult, SceneAnalysisResult, StructureType } from "@/types/music";
+import {
+  pickChordVariantIndex,
+  type ScenePresetRow,
+  SCENE_MUSIC_PRESET_CATALOG,
+} from "@/lib/sceneMusicPresetCatalog";
+import { selectSceneMusicPreset } from "@/lib/selectSceneMusicPreset";
+import type {
+  DensityType,
+  MusicParameterResult,
+  SceneAnalysisResult,
+  StructureType,
+} from "@/types/music";
 
 function clamp(min: number, value: number, max: number): number {
   return Math.min(max, Math.max(min, value));
@@ -23,6 +34,29 @@ function pickRegister(text: string): MusicParameterResult["register"] {
   return "mid";
 }
 
+/** Intensity pushes tempo & density; sparse BGM presets get smaller note gains. */
+function refineDensities(
+  row: ScenePresetRow,
+  intensity: number,
+): { melody: DensityType; rhythm: DensityType } {
+  const i = intensity;
+  let melody: DensityType = row.melody_density;
+  let rhythm: DensityType = row.rhythmicDensity;
+
+  if (row.melodySpacing === "sparse") {
+    if (i > 0.72) melody = melody === "low" ? "medium" : melody;
+    if (i < 0.35) melody = "low";
+  } else if (row.melodySpacing === "dense") {
+    melody = i > 0.55 ? "high" : melody === "medium" ? "medium" : "medium";
+    rhythm = i > 0.55 ? "high" : rhythm;
+  } else {
+    if (i > 0.68) melody = melody === "medium" ? "high" : melody;
+    if (i < 0.38) melody = melody === "high" ? "medium" : "low";
+  }
+
+  return { melody, rhythm };
+}
+
 export function generateMusicParameters(
   scene: SceneAnalysisResult,
   text: string,
@@ -32,59 +66,83 @@ export function generateMusicParameters(
     .sort((a, b) => b[1] - a[1])
     .map(([emotion]) => emotion)
     .find((emotion) => emotion !== dominant) ?? dominant) as SceneAnalysisResult["emotion"];
-  const defaults = EMOTION_DEFAULTS[dominant];
-  const secondaryDefaults = EMOTION_DEFAULTS[secondary];
-  const jitter = Math.round((Math.random() - 0.5) * 8);
   const dominantW = scene.emotion_weights[dominant] ?? 0.4;
-  const secondaryW = scene.emotion_weights[secondary] ?? 0.2;
-  const blendedTempoBase = Math.round(defaults.tempo_bpm * dominantW + secondaryDefaults.tempo_bpm * secondaryW + defaults.tempo_bpm * (1 - dominantW - secondaryW));
-  const tempo = clamp(56, blendedTempoBase + Math.round(scene.energy_level * 16) + jitter, 160);
-  const duration = clamp(20, 30 + Math.round((scene.emotion_intensity - 0.5) * 12), 40);
-  const structure = pickStructure(text, defaults.structure);
+
+  const preset = selectSceneMusicPreset(scene, text);
+  const row = SCENE_MUSIC_PRESET_CATALOG[preset];
+  const int = scene.intensity;
+
+  const tempoMid = (row.tempoRange[0] + row.tempoRange[1]) / 2;
+  const tempoSpan = (row.tempoRange[1] - row.tempoRange[0]) / 2;
+  const tempo = clamp(
+    row.tempoRange[0],
+    Math.round(
+      tempoMid +
+        (scene.energy_level - 0.5) * tempoSpan * 1.15 +
+        (int - 0.5) * tempoSpan * 0.95,
+    ),
+    row.tempoRange[1],
+  );
+
+  const progIdx = pickChordVariantIndex(scene.scene_summary, scene.keywords, preset);
+  const chord_progression = row.chordProgressions[progIdx] ?? row.chordProgressions[0]!;
+
+  const structure = pickStructure(text, row.structure);
   const ambience = Array.from(new Set([...scene.ambience]));
+
+  const { melody: melody_density, rhythm: rhythm_density } = refineDensities(row, int);
+
+  const motif_style =
+    dominantW < 0.55 ? `${row.motifPattern}+${EMOTION_DEFAULTS[secondary].motif_style}` : row.motifPattern;
+
+  const texture =
+    dominantW < 0.55 ? `${row.texture}_blend` : row.texture;
+
   const instrumentation = Array.from(
-    new Set([...defaults.instrumentation, ...secondaryDefaults.instrumentation]),
-  ).slice(0, 4) as MusicParameterResult["instrumentation"];
-  const chordProgression = dominantW < 0.55
-    ? [
-        defaults.chord_progression[0],
-        secondaryDefaults.chord_progression[1] ?? secondaryDefaults.chord_progression[0],
-        defaults.chord_progression[2] ?? defaults.chord_progression[0],
-        secondaryDefaults.chord_progression[3] ?? secondaryDefaults.chord_progression[0],
-      ]
-    : defaults.chord_progression;
+    new Set<MusicParameterResult["instrumentation"][number]>([
+      row.mainInstrument,
+      row.secondaryLayer,
+      "bass",
+      ...(preset === "rain_lonely_night" || scene.environment === "rain" ? (["ambient_noise"] as const) : []),
+      ...(preset === "tense_chase" ? (["percussion"] as const) : []),
+    ]),
+  );
 
   return {
     scene_summary: scene.scene_summary,
     emotion: dominant,
     emotion_weights: scene.emotion_weights,
     emotion_intensity: scene.emotion_intensity,
+    intensity: scene.intensity,
     tension_level: scene.tension_level,
     energy_level: scene.energy_level,
     valence: scene.valence,
     scene_type: scene.scene_type,
     tone: scene.tone,
+    time_feel: scene.time_feel,
+    environment: scene.environment,
+    music_scene_preset: preset,
     tempo_bpm: tempo,
     time_signature: "4/4",
-    key: defaults.key,
-    mode: defaults.mode,
-    duration_sec: duration,
+    key: row.key,
+    mode: row.mode,
+    duration_sec: 30,
     loopable: true,
     structure,
-    dynamics: defaults.dynamics,
-    melody_density: defaults.melody_density,
-    rhythm_density: defaults.rhythm_density,
+    dynamics: row.dynamics,
+    melody_density,
+    rhythm_density,
     register: pickRegister(text),
     instrumentation,
-    texture: dominantW < 0.55 ? `${defaults.texture}_blended` : defaults.texture,
+    texture,
     ambience,
-    harmonic_style: defaults.harmonic_style,
-    chord_progression: chordProgression,
-    motif_style: dominantW < 0.55 ? `${defaults.motif_style}+${secondaryDefaults.motif_style}` : defaults.motif_style,
+    harmonic_style: row.harmonic_style,
+    chord_progression,
+    motif_style,
     keywords: scene.keywords,
     explanation: scene.explanation,
-    generation_notes:
-      `Weighted blend from dominant(${dominant}:${dominantW}) and secondary(${secondary}:${secondaryW}) emotions.`,
+    generation_notes: `BGM preset=${preset}, chordVariant=${progIdx}, tempo=${tempo}, intensity=${int.toFixed(
+      2,
+    )}, env=${scene.environment}, feel=${scene.time_feel}`,
   };
 }
-
