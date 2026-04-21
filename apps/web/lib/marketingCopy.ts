@@ -4,7 +4,7 @@
 export const PAGE_COPY = {
   brand: "BookOST",
   heroSub:
-    "한국어·영어 등 다양한 텍스트에서 감정과 분위기를 해석해 맞춤형 OST를 생성합니다",
+    "한국어·영어 등 다양한 텍스트에서 감정과 분위기를 해석해\n맞춤형 OST를 생성합니다",
   heroTaglineEn: "Translate scenes into music, in any language.",
   badgeLang: "KR · EN Supported",
   sceneTextLabel: "Scene Text",

@@ -325,13 +325,14 @@ export default function HomePage() {
               {PAGE_COPY.heroTaglineEn}
             </span>
           </div>
-          <h1 className="text-balance text-3xl font-extrabold leading-tight tracking-tight text-white sm:text-4xl md:text-5xl lg:text-[2.75rem] lg:leading-[1.12]">
-            언어에 상관없이, 장면을{" "}
+          <h1 className="text-3xl font-extrabold leading-tight tracking-tight text-white sm:text-4xl md:text-5xl lg:text-[2.75rem] lg:leading-[1.12]">
+            이 문장은 ‘소리’가 없습니다
+            <br />
             <span className="bg-gradient-to-r from-indigo-300 to-violet-300 bg-clip-text text-transparent">
-              음악으로 번역합니다
+              우리는 장면을 재생합니다
             </span>
           </h1>
-          <p className="mx-auto mt-6 max-w-2xl text-pretty text-base leading-relaxed text-slate-300 sm:text-lg">
+          <p className="mx-auto mt-6 max-w-2xl whitespace-pre-line text-base leading-relaxed text-slate-300 sm:text-lg">
             {PAGE_COPY.heroSub}
           </p>
         </header>
