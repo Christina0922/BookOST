@@ -10,9 +10,16 @@ import { generateMusicParameters } from "@/lib/generateMusicParameters";
 import { getAudioPresetByEmotion } from "@/lib/mapEmotionToAudio";
 import type { GenerateOstResponse } from "@/types/ost";
 
+type ApiGenerateResponse = { job_id?: string | null };
+
+/**
+ * The UI was using only the client-side (TS) MIDI path, so improvements on the
+ * Python mock pipeline were not heard. When BOOKOST_API_URL is set, we call
+ * FastAPI and stream that WAV through /api/ost-audio/:jobId for playback.
+ */
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { text?: string };
+    const body = (await req.json()) as { text?: string; targetDurationSec?: number };
     const text = body?.text?.trim() ?? "";
 
     if (!text) {
@@ -26,19 +33,51 @@ export async function POST(req: Request) {
     const sceneAnalysis = analyzeScene(text);
     const preset = getAudioPresetByEmotion(sceneAnalysis.emotion);
     const musicParameters = generateMusicParameters(sceneAnalysis, text);
-    const generated = generateMidiFromParameters(musicParameters);
+    let generated = generateMidiFromParameters(musicParameters);
+
+    const back = process.env.BOOKOST_API_URL;
+    let audioUrlOut = preset.audioUrl;
+    let fromBackend = false;
+    if (back) {
+      try {
+        const target =
+          body.targetDurationSec != null && body.targetDurationSec >= 5 && body.targetDurationSec <= 120
+            ? body.targetDurationSec
+            : 30;
+        const upstream = await fetch(`${back.replace(/\/$/, "")}/v1/generate/`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text, target_duration_sec: target }),
+          cache: "no-store",
+        });
+        if (upstream.ok) {
+          const j = (await upstream.json()) as ApiGenerateResponse;
+          if (j.job_id) {
+            audioUrlOut = `/api/ost-audio/${j.job_id}`;
+            generated = { notes: [], midi_base64: "" };
+            fromBackend = true;
+          }
+        }
+      } catch {
+        // local TS MIDI + preset / public fallback
+      }
+    }
 
     // public/audio missing fallback handling
     const audioPath = join(process.cwd(), "public", preset.audioUrl.replace(/^\//, ""));
     const finalPreset = preset;
     const fallbackAudioReady = existsSync(audioPath);
-    const isAudioReady = generated.notes.length > 0 || fallbackAudioReady;
-    const fallbackReason: "preset_missing" | "all_missing" | undefined = isAudioReady ? undefined : "all_missing";
+    const isAudioReady = fromBackend || generated.notes.length > 0 || fallbackAudioReady;
+    const fallbackReason: "preset_missing" | "all_missing" | undefined = isAudioReady
+      ? undefined
+      : "all_missing";
 
     const resolvedPreset = {
       ...finalPreset,
       description: isAudioReady
-        ? finalPreset.description
+        ? fromBackend
+          ? `${finalPreset.description} (서버·파이프라인 OST가 재생됩니다.)`
+          : finalPreset.description
         : `${finalPreset.description} (Mock OST 프리셋만 연결됨: /audio/${finalPreset.emotion}.mp3 파일을 추가하세요)`,
     };
 
@@ -59,7 +98,7 @@ export async function POST(req: Request) {
       ostTitle: resolvedPreset.ostTitle,
       description: resolvedPreset.description,
       sceneInterpretation: resolvedPreset.sceneInterpretation,
-      audioUrl: resolvedPreset.audioUrl,
+      audioUrl: audioUrlOut,
       tags: resolvedPreset.tags,
       selectedPresetEmotion: resolvedPreset.emotion,
       isAudioReady,

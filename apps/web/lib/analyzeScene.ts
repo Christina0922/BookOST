@@ -25,24 +25,66 @@ function normalize(text: string): string {
   return text.trim().toLowerCase();
 }
 
+/** Stable 32-bit digest so *different* prose gets *different* base weights (no flat 0.24…0.27). */
+function fnv1a32(input: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function sharpenWeights(weights: Record<EmotionType, number>, power: number): Record<EmotionType, number> {
+  const keys = Object.keys(weights) as EmotionType[];
+  const raw: Record<EmotionType, number> = {
+    tense: 0,
+    sad: 0,
+    calm: 0,
+    mysterious: 0,
+  };
+  let sum = 0;
+  for (const k of keys) {
+    const v = Math.max(0.01, weights[k]) ** power;
+    raw[k] = v;
+    sum += v;
+  }
+  const out: Record<EmotionType, number> = { ...raw };
+  for (const k of keys) {
+    out[k] = Number((out[k] / sum).toFixed(2));
+  }
+  const drift = 1 - (out.tense + out.sad + out.calm + out.mysterious);
+  if (Math.abs(drift) > 0.001) {
+    const top = (Object.keys(out) as EmotionType[]).sort((a, b) => out[b] - out[a])[0] ?? "calm";
+    out[top] = Number((out[top] + drift).toFixed(2));
+  }
+  return out;
+}
+
 function detectEmotionWeights(text: string): {
   dominantEmotion: EmotionType;
   weights: Record<EmotionType, number>;
   keywords: string[];
 } {
   const normalized = normalize(text);
+  const h = fnv1a32(normalized);
+  const order: EmotionType[] = ["tense", "sad", "calm", "mysterious"];
   const baseScores: Record<EmotionType, number> = {
-    tense: 0.22,
-    sad: 0.2,
-    calm: 0.22,
-    mysterious: 0.18,
+    tense: 0,
+    sad: 0,
+    calm: 0,
+    mysterious: 0,
   };
+  for (let i = 0; i < 4; i += 1) {
+    const slot = (h >>> (i * 7)) & 0x7f; // 0..127
+    baseScores[order[i]] = 0.1 + (slot / 127) * 0.45;
+  }
   const keywordBag = new Set<string>();
 
-  for (const emotion of Object.keys(EMOTION_KEYWORDS) as EmotionType[]) {
+  for (const emotion of order) {
     for (const keyword of EMOTION_KEYWORDS[emotion]) {
       if (normalized.includes(keyword)) {
-        baseScores[emotion] += 0.14;
+        baseScores[emotion] += 0.16;
         keywordBag.add(keyword);
       }
     }
@@ -58,16 +100,13 @@ function detectEmotionWeights(text: string): {
   }
 
   const total = Object.values(baseScores).reduce((acc, value) => acc + value, 0);
-  const weights: Record<EmotionType, number> = {
-    tense: Number((baseScores.tense / total).toFixed(2)),
-    sad: Number((baseScores.sad / total).toFixed(2)),
-    calm: Number((baseScores.calm / total).toFixed(2)),
-    mysterious: Number((baseScores.mysterious / total).toFixed(2)),
+  const prelim: Record<EmotionType, number> = {
+    tense: baseScores.tense / total,
+    sad: baseScores.sad / total,
+    calm: baseScores.calm / total,
+    mysterious: baseScores.mysterious / total,
   };
-  const drift = Number((1 - (weights.tense + weights.sad + weights.calm + weights.mysterious)).toFixed(2));
-  if (Math.abs(drift) > 0) {
-    weights.calm = Number((weights.calm + drift).toFixed(2));
-  }
+  const weights = sharpenWeights(prelim, 1.28);
 
   const dominantEmotion =
     (Object.keys(weights) as EmotionType[]).sort((a, b) => weights[b] - weights[a])[0] ?? "calm";
@@ -142,13 +181,66 @@ function buildInterpretiveExplanation(
   return `이 문장은 ${topEmotion}(${topWeight.toFixed(2)})를 중심으로 ${secondEmotion}(${secondWeight.toFixed(2)})가 함께 느껴지는 ${sceneType} 장면입니다. 톤 ${tone}, 시간감 ${timeFeel}, 공간감(환경) ${env}로 해석했습니다.`;
 }
 
+function hashVariant<T>(text: string, pool: readonly T[]): T {
+  const h = fnv1a32(normalize(text));
+  return pool[h % pool.length] as T;
+}
+
+/** If everything defaults to generic “neutral / reflection”, still split scenes by full text. */
+function diversifySceneLabels(
+  text: string,
+  sceneType: SceneType,
+  tone: ToneType,
+  timeFeel: TimeFeel,
+  environment: EnvironmentKind,
+  hadEmotionKeywords: boolean,
+): { sceneType: SceneType; tone: ToneType; timeFeel: TimeFeel; environment: EnvironmentKind } {
+  const t = normalize(text);
+  const reflectionCue = ["회상", "생각", "돌아보", "반성", "추억"].some((w) => t.includes(w));
+
+  let st = sceneType;
+  if (st === "reflection" && !reflectionCue) {
+    st = hashVariant(text, ["suspense_build", "quiet_moment", "preparation", "reflection"] as const);
+  }
+
+  let tn = tone;
+  if (tn === "neutral" && !hadEmotionKeywords) {
+    tn = hashVariant(text, ["neutral", "dark", "serious", "light"] as const);
+  }
+
+  let tf = timeFeel;
+  if (tf === "moderate") {
+    tf = hashVariant(text, ["moderate", "slow", "floating", "urgent", "driving"] as const);
+  }
+
+  let env = environment;
+  if (env === "neutral") {
+    env = hashVariant(text, ["neutral", "interior", "night", "city", "rain"] as const);
+  }
+
+  return { sceneType: st, tone: tn, timeFeel: tf, environment: env };
+}
+
 export function analyzeScene(text: string): SceneAnalysisResult {
   const detection = detectEmotionWeights(text);
   const defaults = EMOTION_DEFAULTS[detection.dominantEmotion];
-  const sceneType = detectSceneType(text);
-  const tone = detectTone(text);
-  const timeFeel = detectTimeFeel(text);
-  const environment = detectEnvironment(text);
+  let sceneType = detectSceneType(text);
+  let tone = detectTone(text);
+  let timeFeel = detectTimeFeel(text);
+  let environment = detectEnvironment(text);
+
+  const diversified = diversifySceneLabels(
+    text,
+    sceneType,
+    tone,
+    timeFeel,
+    environment,
+    detection.keywords.length > 0,
+  );
+  sceneType = diversified.sceneType;
+  tone = diversified.tone;
+  timeFeel = diversified.timeFeel;
+  environment = diversified.environment;
   const ambience = Array.from(new Set([...detectAmbience(text)]));
   const sortedWeights = Object.entries(detection.weights).sort((a, b) => b[1] - a[1]);
   const topWeight = sortedWeights[0]?.[1] ?? 0.25;
